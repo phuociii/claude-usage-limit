@@ -22,6 +22,20 @@ Có 2 cách dùng, chọn một:
 
 ---
 
+## Cách 0: Tải app build sẵn (không cần Xcode / Command Line Tools)
+
+1. Vào tab **Actions** của repo → chọn lần chạy **Build macOS app** mới nhất → tải **ClaudeUsageBar** ở mục *Artifacts*.
+2. Giải nén (có thể phải giải nén 2 lần) → kéo `ClaudeUsageBar.app` vào **Applications**.
+3. App chưa được Apple ký nên cần gỡ cờ cách ly một lần:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/ClaudeUsageBar.app
+```
+
+```bash
+open /Applications/ClaudeUsageBar.app
+```
+
 ## Cách 1: App native (Swift, không cần cài gì thêm)
 
 Yêu cầu macOS 13+ và Xcode Command Line Tools (`xcode-select --install`).
