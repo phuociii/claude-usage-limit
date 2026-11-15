@@ -11,8 +11,8 @@ BIN="$APP/Contents/MacOS/ClaudeUsageBar"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "→ Compiling…"
-swiftc -O \
+echo "→ Compiling… (swiftc: $(xcrun -f swiftc), SDK: $(xcrun --show-sdk-path))"
+xcrun swiftc -O \
   -framework AppKit -framework ServiceManagement \
   -parse-as-library Sources/ClaudeUsageBar.swift -o "$BIN"
 
