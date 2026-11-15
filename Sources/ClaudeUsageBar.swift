@@ -6,6 +6,7 @@
 // hoặc từ ~/.claude/.credentials.json, hoặc biến môi trường CLAUDE_CODE_OAUTH_TOKEN.
 
 import AppKit
+import Security
 import ServiceManagement
 
 // MARK: - Model
@@ -26,16 +27,22 @@ struct UsageResponse: Decodable {
 
 enum UsageError: LocalizedError {
     case noCredentials
+    case keychainDenied(Int32)
     case unauthorized
+    case sessionInvalid
     case http(Int, String)
     case decode(String)
 
     var errorDescription: String? {
         switch self {
         case .noCredentials:
-            return "Không tìm thấy token Claude Code. Hãy cài Claude Code và chạy `claude` để đăng nhập."
+            return "Không tìm thấy token Claude Code trong Keychain. Chạy `claude` trong Terminal để đăng nhập, hoặc dùng mục \"Đăng nhập bằng sessionKey claude.ai…\" bên dưới."
+        case .keychainDenied(let code):
+            return "macOS không cho đọc Keychain (mã \(code)). Bấm Làm mới và chọn \"Always Allow\" khi được hỏi."
         case .unauthorized:
-            return "Token hết hạn. Mở Terminal và chạy `claude` một lần để làm mới token."
+            return "Token Claude Code hết hạn. Mở Terminal và chạy `claude` một lần để làm mới token."
+        case .sessionInvalid:
+            return "sessionKey claude.ai không hợp lệ hoặc đã hết hạn. Hãy nhập lại."
         case .http(let code, let body):
             return "Lỗi HTTP \(code): \(body.prefix(120))"
         case .decode(let msg):
@@ -87,41 +94,108 @@ func color(for pct: Double) -> NSColor {
 // MARK: - Credentials
 
 enum Credentials {
-    static func accessToken() throws -> String {
+    /// Token OAuth của Claude Code.
+    static func claudeCodeToken() throws -> String {
         if let t = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !t.isEmpty {
             return t
         }
-        if let json = keychainJSON(), let t = extractToken(json) { return t }
 
-        let file = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/.credentials.json")
-        if let data = try? Data(contentsOf: file), let t = extractToken(data) { return t }
+        var deniedCode: Int32?
+        for service in claudeCodeKeychainServices() {
+            let (status, data) = runSecurity(["find-generic-password", "-s", service, "-w"])
+            if status == 0, let data, let t = extractToken(data) { return t }
+            if status != 0 && status != 44 { deniedCode = status } // 44 = không có mục này
+        }
 
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        var dirs = [home.appendingPathComponent(".claude"), home.appendingPathComponent(".config/claude")]
+        if let custom = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] {
+            dirs.insert(URL(fileURLWithPath: custom), at: 0)
+        }
+        for dir in dirs {
+            if let data = try? Data(contentsOf: dir.appendingPathComponent(".credentials.json")),
+               let t = extractToken(data) { return t }
+        }
+
+        if let code = deniedCode { throw UsageError.keychainDenied(code) }
         throw UsageError.noCredentials
+    }
+
+    /// Liệt kê các mục Keychain có tên bắt đầu bằng "Claude Code-credentials"
+    /// (Claude Code có thể thêm hậu tố khi dùng CLAUDE_CONFIG_DIR). Chỉ đọc thuộc tính nên không hỏi quyền.
+    private static func claudeCodeKeychainServices() -> [String] {
+        var result = ["Claude Code-credentials"]
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true,
+        ]
+        var items: CFTypeRef?
+        if SecItemCopyMatching(query as CFDictionary, &items) == errSecSuccess,
+           let list = items as? [[String: Any]] {
+            for item in list {
+                if let svc = item[kSecAttrService as String] as? String,
+                   svc.hasPrefix("Claude Code-credentials"), !result.contains(svc) {
+                    result.append(svc)
+                }
+            }
+        }
+        return result
     }
 
     /// Dùng /usr/bin/security để đọc Keychain: macOS chỉ hỏi quyền 1 lần ("Always Allow")
     /// và quyền đó không bị mất khi build lại app.
-    private static func keychainJSON() -> Data? {
+    private static func runSecurity(_ args: [String]) -> (Int32, Data?) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        p.arguments = args
         let out = Pipe()
         p.standardOutput = out
         p.standardError = Pipe()
-        do { try p.run() } catch { return nil }
+        do { try p.run() } catch { return (-1, nil) }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard p.terminationStatus == 0, !data.isEmpty else { return nil }
-        return data
+        return (p.terminationStatus, data.isEmpty ? nil : data)
     }
 
     private static func extractToken(_ data: Data) -> String? {
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = obj["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String, !token.isEmpty
-        else { return nil }
-        return token
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let oauth = (obj["claudeAiOauth"] as? [String: Any]) ?? obj
+        if let token = oauth["accessToken"] as? String, !token.isEmpty { return token }
+        return nil
+    }
+
+    // MARK: sessionKey claude.ai (lưu trong Keychain của chính app)
+
+    private static let ownService = "ClaudeUsageBar"
+    private static let ownAccount = "claude.ai-sessionKey"
+
+    static var sessionKey: String? {
+        get {
+            let q: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: ownService,
+                kSecAttrAccount as String: ownAccount,
+                kSecReturnData as String: true,
+            ]
+            var out: CFTypeRef?
+            guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+                  let data = out as? Data, let s = String(data: data, encoding: .utf8), !s.isEmpty
+            else { return nil }
+            return s
+        }
+        set {
+            let base: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: ownService,
+                kSecAttrAccount as String: ownAccount,
+            ]
+            SecItemDelete(base as CFDictionary)
+            guard let v = newValue, !v.isEmpty else { return }
+            var add = base
+            add[kSecValueData as String] = Data(v.utf8)
+            SecItemAdd(add as CFDictionary, nil)
+        }
     }
 }
 
@@ -129,25 +203,73 @@ enum Credentials {
 
 enum UsageAPI {
     static func fetch() async throws -> UsageResponse {
-        let token = try Credentials.accessToken()
+        // Ưu tiên sessionKey nếu người dùng đã nhập, sau đó tới token Claude Code.
+        if let key = Credentials.sessionKey {
+            return try await fetchWeb(sessionKey: key)
+        }
+        return try await fetchOAuth(token: try Credentials.claudeCodeToken())
+    }
+
+    private static func fetchOAuth(token: String) async throws -> UsageResponse {
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         req.timeoutInterval = 20
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("claude-usage-bar/1.0", forHTTPHeaderField: "User-Agent")
+        let data = try await send(req, authError: .unauthorized)
+        return try decode(data)
+    }
 
+    private static func webRequest(_ url: String, _ key: String) -> URLRequest {
+        var req = URLRequest(url: URL(string: url)!)
+        req.timeoutInterval = 20
+        req.httpShouldHandleCookies = false
+        req.setValue("sessionKey=\(key)", forHTTPHeaderField: "Cookie")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("https://claude.ai/settings/usage", forHTTPHeaderField: "Referer")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+                     forHTTPHeaderField: "User-Agent")
+        return req
+    }
+
+    private static func fetchWeb(sessionKey key: String) async throws -> UsageResponse {
+        let defaults = UserDefaults.standard
+        var org = defaults.string(forKey: "orgId")
+        if org == nil {
+            let data = try await send(webRequest("https://claude.ai/api/organizations", key), authError: .sessionInvalid)
+            guard let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                throw UsageError.decode("danh sách organization")
+            }
+            // Ưu tiên tổ chức có quyền chat (tài khoản Pro/Max cá nhân).
+            let chosen = list.first { ($0["capabilities"] as? [String])?.contains("chat") == true } ?? list.first
+            org = chosen?["uuid"] as? String
+            guard let org else { throw UsageError.decode("không tìm thấy organization") }
+            defaults.set(org, forKey: "orgId")
+        }
+        do {
+            let data = try await send(webRequest("https://claude.ai/api/organizations/\(org!)/usage", key),
+                                      authError: .sessionInvalid)
+            return try decode(data)
+        } catch {
+            defaults.removeObject(forKey: "orgId") // lần sau tìm lại org
+            throw error
+        }
+    }
+
+    private static func send(_ req: URLRequest, authError: UsageError) async throws -> Data {
         let (data, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        if code == 401 || code == 403 { throw UsageError.unauthorized }
+        if code == 401 || code == 403 { throw authError }
         guard (200..<300).contains(code) else {
             throw UsageError.http(code, String(data: data, encoding: .utf8) ?? "")
         }
-        do {
-            return try JSONDecoder().decode(UsageResponse.self, from: data)
-        } catch {
-            throw UsageError.decode(error.localizedDescription)
-        }
+        return data
+    }
+
+    private static func decode(_ data: Data) throws -> UsageResponse {
+        do { return try JSONDecoder().decode(UsageResponse.self, from: data) }
+        catch { throw UsageError.decode(error.localizedDescription) }
     }
 }
 
@@ -185,6 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         menu.delegate = self
+        menu.autoenablesItems = false
         statusItem.menu = menu
         updateTitle()
         rebuildMenu()
@@ -298,6 +421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let header = NSMenuItem(title: "Claude Usage", action: nil, keyEquivalent: "")
         header.attributedTitle = NSAttributedString(
             string: "Claude Usage", attributes: [.font: NSFont.boldSystemFont(ofSize: 13)])
+        header.isEnabled = false
         menu.addItem(header)
         menu.addItem(.separator())
 
@@ -343,6 +467,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         web.target = self
         menu.addItem(web)
 
+        if Credentials.sessionKey == nil {
+            let sk = NSMenuItem(title: "Đăng nhập bằng sessionKey claude.ai…", action: #selector(enterSessionKey), keyEquivalent: "")
+            sk.target = self
+            menu.addItem(sk)
+        } else {
+            let sk = NSMenuItem(title: "Xoá sessionKey (dùng lại token Claude Code)", action: #selector(clearSessionKey), keyEquivalent: "")
+            sk.target = self
+            menu.addItem(sk)
+        }
+
         let login = NSMenuItem(title: "Khởi động cùng macOS", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -387,6 +521,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openWeb() {
         NSWorkspace.shared.open(URL(string: "https://claude.ai/settings/usage")!)
+    }
+
+    @objc private func enterSessionKey() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Nhập sessionKey của claude.ai"
+        alert.informativeText = """
+        Dùng khi bạn không cài Claude Code.
+        1. Mở claude.ai trên trình duyệt (đã đăng nhập).
+        2. Mở Developer Tools (⌥⌘I) → tab Application/Storage → Cookies → https://claude.ai.
+        3. Copy giá trị cookie "sessionKey" (bắt đầu bằng sk-ant-sid…) và dán vào đây.
+        Key được lưu trong Keychain của máy bạn và chỉ gửi tới claude.ai.
+        """
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "sk-ant-sid01-…"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Lưu")
+        alert.addButton(withTitle: "Huỷ")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        var key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.hasPrefix("sessionKey=") { key.removeFirst("sessionKey=".count) }
+        guard !key.isEmpty else { return }
+        Credentials.sessionKey = key
+        UserDefaults.standard.removeObject(forKey: "orgId")
+        usage = nil
+        lastError = nil
+        refresh()
+    }
+
+    @objc private func clearSessionKey() {
+        Credentials.sessionKey = nil
+        UserDefaults.standard.removeObject(forKey: "orgId")
+        usage = nil
+        lastError = nil
+        refresh()
     }
 
     @objc private func toggleLogin() {
