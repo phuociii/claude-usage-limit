@@ -60,7 +60,7 @@ cp swiftbar/claude-usage.5m.sh ~/Library/Application\ Support/SwiftBar/Plugins/
 | Biểu hiện | Cách sửa |
 |---|---|
 | `!` / "Token hết hạn" | Mở Terminal, chạy `claude` một lần (Claude Code tự làm mới token), rồi bấm **Làm mới** |
-| "Không tìm thấy token" | Cài Claude Code và đăng nhập. Hoặc đặt biến `CLAUDE_CODE_OAUTH_TOKEN` (tạo bằng `claude setup-token`) |
+| "Không tìm thấy token" | Cài Claude Code và đăng nhập. (Hoặc đặt biến môi trường `CLAUDE_CODE_OAUTH_TOKEN` chứa access token) |
 | Không có số tuần Opus/Sonnet | Bình thường: API chỉ trả về khi gói của bạn có giới hạn riêng |
 
 > Lưu ý: `api/oauth/usage` là endpoint nội bộ Claude Code dùng, không phải API công khai, nên có thể thay đổi trong tương lai.
